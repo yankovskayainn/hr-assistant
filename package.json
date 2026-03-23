@@ -1,0 +1,13 @@
+# ── Anthropic ──────────────────────────────────────────
+ANTHROPIC_API_KEY=your_api_key_here
+
+# ── Server ─────────────────────────────────────────────
+PORT=3000
+
+# ── Optional: simple access password for your team ─────
+# Leave blank to disable password protection
+TEAM_PASSWORD=
+
+# ── Upload limits ───────────────────────────────────────
+MAX_FILE_SIZE_MB=20
+MAX_POLICIES=20
