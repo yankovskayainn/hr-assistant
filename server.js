@@ -112,13 +112,33 @@ app.post('/api/chat', authGuard, async (req, res) => {
   if (!message) return res.status(400).json({ error: 'message is required' });
 
   const policiesResult = await pool.query('SELECT name, content FROM policies ORDER BY created_at');
+
+  // Smart search — find relevant sections based on the question
+  const question = message.toLowerCase();
   const policyContext = policiesResult.rows.length > 0
-    ? '\n\n--- COMPANY HR POLICIES ---\n' + policiesResult.rows.map(p => `\n[DOCUMENT: ${p.name}]\n${p.content.substring(0, 8000)}`).join('\n\n')
+    ? '\n\n--- COMPANY HR POLICIES ---\n' + policiesResult.rows.map(p => {
+        const content = p.content;
+        const words = question.split(' ').filter(w => w.length > 3);
+        // Find the most relevant chunk by searching for keywords
+        let bestStart = 0;
+        let bestScore = 0;
+        const chunkSize = 15000;
+        for (let i = 0; i < content.length - chunkSize; i += 2000) {
+          const chunk = content.substring(i, i + chunkSize).toLowerCase();
+          const score = words.reduce((s, w) => s + (chunk.split(w).length - 1), 0);
+          if (score > bestScore) { bestScore = score; bestStart = i; }
+        }
+        // Always include the beginning (table of contents / overview)
+        const beginning = content.substring(0, 3000);
+        const relevant  = content.substring(bestStart, bestStart + 15000);
+        const combined  = bestStart < 3000 ? relevant : beginning + '\n...\n' + relevant;
+        return `\n[DOCUMENT: ${p.name}]\n${combined}`;
+      }).join('\n\n')
     : '\n\n[No HR policy documents loaded. Provide general HR best-practice guidance and clearly state this is not company-specific.]';
 
   const systemWithPolicies = SYSTEM_PROMPT + policyContext;
   const modePrefix = mode === 'email' ? 'The following is a staff email. Please reply as Alex with all three parts:\n\n' : '';
-  const messages = [...history.slice(-20), { role: 'user', content: modePrefix + message }];
+  const messages = [...history.slice(-6), { role: 'user', content: modePrefix + message }];
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
