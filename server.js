@@ -113,29 +113,5 @@ app.post('/api/chat', authGuard, async (req, res) => {
 
   const policiesResult = await pool.query('SELECT name, content FROM policies ORDER BY created_at');
   const policyContext = policiesResult.rows.length > 0
-    ? '\n\n--- COMPANY HR POLICIES ---\n' + policiesResult.rows.map(p => `\n[DOCUMENT: ${p.name}]\n${p.content}`).join('\n\n')
-    : '\n\n[No HR policy documents loaded. Provide general HR best-practice guidance and clearly state this is not company-specific.]';
-
-  const systemWithPolicies = SYSTEM_PROMPT + policyContext;
-  const modePrefix = mode === 'email' ? 'The following is a staff email. Please reply as Alex with all three parts:\n\n' : '';
-  const messages = [...history.slice(-20), { role: 'user', content: modePrefix + message }];
-
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1500, system: systemWithPolicies, messages })
-    });
-    if (!response.ok) { const t = await response.text(); throw new Error(t); }
-    const data  = await response.json();
-    const reply = data.content?.map(b => b.text || '').join('') || '';
-    res.json({ reply, policiesLoaded: policiesResult.rows.length });
-  } catch(err) {
-    console.error('Chat error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-initDB().then(() => {
-  app.listen(PORT, () => console.log(`HR Assistant running on port ${PORT}`));
-});
+    ? '\n\n--- COMPANY HR POLICIES ---\n' + policiesResult.rows.map(p => `\n[DOCUMENT: ${p.name}]\n${p.content.substring(0, 8000)}`).join('\n\n')
+    : '\n\n[No HR policy documents loaded. Provide general HR best-practice guidance and clearly state this is n
