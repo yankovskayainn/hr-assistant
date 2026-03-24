@@ -1,23 +1,36 @@
 require('dotenv').config();
-const express = require('express');
-const multer  = require('multer');
-const cors    = require('cors');
-const path    = require('path');
-const fs      = require('fs');
-const fetch   = require('node-fetch');
-const pdf     = require('pdf-parse');
-const mammoth = require('mammoth');
+const express  = require('express');
+const multer   = require('multer');
+const cors     = require('cors');
+const path     = require('path');
+const fetch    = require('node-fetch');
+const pdf      = require('pdf-parse');
+const mammoth  = require('mammoth');
+const { Pool } = require('pg');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
-const MAX_FILE_SIZE_MB = parseInt(process.env.MAX_FILE_SIZE_MB || '20');
-const MAX_POLICIES     = parseInt(process.env.MAX_POLICIES     || '20');
-const TEAM_PASSWORD    = process.env.TEAM_PASSWORD || '';
-const API_KEY          = process.env.ANTHROPIC_API_KEY;
+const TEAM_PASSWORD = process.env.TEAM_PASSWORD || '';
+const API_KEY       = process.env.ANTHROPIC_API_KEY;
 
-if (!API_KEY) {
-  console.error('ANTHROPIC_API_KEY is not set');
-  process.exit(1);
+if (!API_KEY) { console.error('ANTHROPIC_API_KEY not set'); process.exit(1); }
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS policies (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      size INTEGER,
+      content TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log('Database ready');
 }
 
 app.use(cors());
@@ -31,79 +44,50 @@ function authGuard(req, res, next) {
   next();
 }
 
-const sessions = new Map();
-
-function getSession(id) {
-  if (!sessions.has(id)) sessions.set(id, { policies: [], messages: [] });
-  return sessions.get(id);
-}
-
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_FILE_SIZE_MB * 1024 * 1024 },
+  limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter(req, file, cb) {
-    const allowed = ['.pdf', '.docx', '.doc', '.txt'];
     const ext = path.extname(file.originalname).toLowerCase();
-    if (allowed.includes(ext)) cb(null, true);
-    else cb(new Error('Unsupported file type: ' + ext));
+    ['.pdf','.docx','.doc','.txt'].includes(ext) ? cb(null,true) : cb(new Error('Unsupported file type'));
   }
 });
 
 async function extractText(file) {
   const ext = path.extname(file.originalname).toLowerCase();
-  if (ext === '.pdf') {
-    const data = await pdf(file.buffer);
-    return data.text;
-  }
-  if (ext === '.docx' || ext === '.doc') {
-    const { value } = await mammoth.extractRawText({ buffer: file.buffer });
-    return value;
-  }
+  if (ext === '.pdf') { const d = await pdf(file.buffer); return d.text; }
+  if (ext === '.docx' || ext === '.doc') { const { value } = await mammoth.extractRawText({ buffer: file.buffer }); return value; }
   return file.buffer.toString('utf-8');
 }
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-app.post('/api/policies', authGuard, upload.array('files', MAX_POLICIES), async (req, res) => {
-  const sessionId = req.headers['x-session-id'] || 'default';
-  const session   = getSession(sessionId);
-  if (!req.files || req.files.length === 0)
-    return res.status(400).json({ error: 'No files uploaded' });
-  const added = [];
-  const errors = [];
+app.post('/api/policies', authGuard, upload.array('files', 20), async (req, res) => {
+  if (!req.files?.length) return res.status(400).json({ error: 'No files uploaded' });
+  const added = [], errors = [];
   for (const file of req.files) {
     try {
       const text = await extractText(file);
-      session.policies.push({ name: file.originalname, size: file.size, text });
+      await pool.query('INSERT INTO policies (name, size, content) VALUES ($1, $2, $3)', [file.originalname, file.size, text]);
       added.push({ name: file.originalname, size: file.size, chars: text.length });
-    } catch (e) {
-      errors.push({ name: file.originalname, error: e.message });
-    }
+    } catch(e) { errors.push({ name: file.originalname, error: e.message }); }
   }
-  res.json({ added, errors, total: session.policies.length });
+  const total = (await pool.query('SELECT COUNT(*) FROM policies')).rows[0].count;
+  res.json({ added, errors, total: parseInt(total) });
 });
 
-app.get('/api/policies', authGuard, (req, res) => {
-  const sessionId = req.headers['x-session-id'] || 'default';
-  const session   = getSession(sessionId);
-  res.json(session.policies.map(p => ({ name: p.name, size: p.size, chars: p.text.length })));
+app.get('/api/policies', authGuard, async (req, res) => {
+  const result = await pool.query('SELECT id, name, size, length(content) as chars FROM policies ORDER BY created_at');
+  res.json(result.rows);
 });
 
-app.delete('/api/policies/:index', authGuard, (req, res) => {
-  const sessionId = req.headers['x-session-id'] || 'default';
-  const session   = getSession(sessionId);
-  const idx       = parseInt(req.params.index);
-  if (idx < 0 || idx >= session.policies.length)
-    return res.status(404).json({ error: 'Policy not found' });
-  const removed = session.policies.splice(idx, 1)[0];
-  res.json({ removed: removed.name, total: session.policies.length });
+app.delete('/api/policies/:id', authGuard, async (req, res) => {
+  await pool.query('DELETE FROM policies WHERE id = $1', [req.params.id]);
+  res.json({ deleted: true });
 });
 
-app.delete('/api/policies', authGuard, (req, res) => {
-  const sessionId = req.headers['x-session-id'] || 'default';
-  const session   = getSession(sessionId);
-  session.policies = [];
-  session.messages = [];
+app.delete('/api/policies', authGuard, async (req, res) => {
+  await pool.query('DELETE FROM policies');
   res.json({ cleared: true });
 });
 
@@ -118,83 +102,40 @@ Answer directly and confidently in first person. Explain the situation, your int
 📌 Policy reference: [Policy name — Section number: clause or summary]
 
 Part 2 — Formal Email to Employee:
-Write a professional, warm, empathetic email ready to send directly to the employee. This email must:
-- Explain the situation in plain, human language the employee can easily understand
-- Give enough information so the employee knows where they stand and what happens next
-- Sound natural and personal — not like a policy document
-- Never mention policy names, section numbers, or clause references
-- End with an invitation to ask further questions
+Write a professional, warm, empathetic email ready to send directly to the employee. This email must explain the situation in plain human language, never mention policy names or section numbers, and end with an invitation to ask further questions.
 
 Part 3 — Informal Note from Alex:
-Write a short friendly message as if you are Alex speaking directly to the employee in a casual human way. This should:
-- Feel like it is coming from a real person who genuinely cares
-- Use simple everyday language — warm, conversational, no formality
-- Briefly reassure the employee and let them know you are available to talk
-- Be short — 3 to 5 sentences maximum
-- Never mention policy names, section numbers, or clause references`;
+Write a short friendly message as if you are Alex speaking directly to the employee in a casual human way. 3 to 5 sentences maximum. Never mention policy names or section numbers.`;
 
 app.post('/api/chat', authGuard, async (req, res) => {
-  const sessionId = req.headers['x-session-id'] || 'default';
-  const session   = getSession(sessionId);
   const { message, mode = 'question', history = [] } = req.body;
+  if (!message) return res.status(400).json({ error: 'message is required' });
 
-  if (!message || typeof message !== 'string')
-    return res.status(400).json({ error: 'message is required' });
-
-  const policyContext = session.policies.length > 0
-    ? '\n\n--- COMPANY HR POLICIES ---\n' +
-      session.policies.map(p => `\n[DOCUMENT: ${p.name}]\n${p.text}`).join('\n\n')
+  const policiesResult = await pool.query('SELECT name, content FROM policies ORDER BY created_at');
+  const policyContext = policiesResult.rows.length > 0
+    ? '\n\n--- COMPANY HR POLICIES ---\n' + policiesResult.rows.map(p => `\n[DOCUMENT: ${p.name}]\n${p.content}`).join('\n\n')
     : '\n\n[No HR policy documents loaded. Provide general HR best-practice guidance and clearly state this is not company-specific.]';
 
   const systemWithPolicies = SYSTEM_PROMPT + policyContext;
-
-  const modePrefix = mode === 'email'
-    ? 'The following is a staff email. Please draft a professional HR reply with policy references:\n\n'
-    : '';
-
-  const trimmedHistory = history.slice(-20);
-  const messages = [
-    ...trimmedHistory,
-    { role: 'user', content: modePrefix + message }
-  ];
+  const modePrefix = mode === 'email' ? 'The following is a staff email. Please reply as Alex with all three parts:\n\n' : '';
+  const messages = [...history.slice(-20), { role: 'user', content: modePrefix + message }];
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1500,
-        system: systemWithPolicies,
-        messages
-      })
+      headers: { 'content-type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1500, system: systemWithPolicies, messages })
     });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error('Anthropic error: ' + errText);
-    }
-
+    if (!response.ok) { const t = await response.text(); throw new Error(t); }
     const data  = await response.json();
     const reply = data.content?.map(b => b.text || '').join('') || '';
-
-    res.json({
-      reply,
-      model: data.model,
-      usage: data.usage || {},
-      policiesLoaded: session.policies.length
-    });
-
-  } catch (err) {
+    res.json({ reply, policiesLoaded: policiesResult.rows.length });
+  } catch(err) {
     console.error('Chat error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`HR Assistant running on port ${PORT}`);
+initDB().then(() => {
+  app.listen(PORT, () => console.log(`HR Assistant running on port ${PORT}`));
 });
